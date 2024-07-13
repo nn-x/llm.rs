@@ -471,6 +471,8 @@ def write_model(model, filename, dtype):
     print(f"padded vocab size from {wte.size(0)} to {wte_padded.size(0)}")
     header[7] = wte_padded.size(0) # padded vocab size store in header
     # now write to file
+    if not os.path.exists(filename):
+        os.makedirs(os.path.dirname(filename), exist_ok=True)
     with open(filename, "wb") as file:
         file.write(header.numpy().tobytes()) # header
         write_tensors(params, model.config.n_layer, file, dtype) # params
@@ -491,6 +493,8 @@ def write_state(model, x, y, logits, loss, filename):
     wte_grad_padded = pad_vocab(wte_grad, value=0) # (Vp, C) # TODO later maybe pad with nan?
     grads["transformer.wte.weight"] = wte_grad_padded # (Vp, C)
     print(f"padded vocab size in reference grads from {wte_grad.size(0)} to {wte_grad_padded.size(0)}")
+    if not os.path.exists(filename):
+        os.makedirs(os.path.dirname(filename), exist_ok=True)
     with open(filename, "wb") as file:
         # header
         file.write(header.numpy().tobytes())
@@ -542,7 +546,7 @@ if __name__ == "__main__":
     # and save model weights and debug state to disk on the first iteration
     parser = argparse.ArgumentParser()
     # file system input / output
-    parser.add_argument("--input_bin", type=str, default="dev/data/tinyshakespeare/tiny_shakespeare_val.bin", help="input .bin to train on")
+    parser.add_argument("--input_bin", type=str, default="data/tiny_shakespeare_val.bin", help="input .bin to train on")
     parser.add_argument("--input_val_bin", type=str, default="", help="input .bin to eval validation loss on")
     parser.add_argument("--output_dir", type=str, default="", help="output directory to which to write logs and checkpoints")
     parser.add_argument("--model", type=str, default="gpt2", help="gpt2|gpt2-medium|gpt2-large|gpt2-xl|d12|d24|d36|d48")
@@ -645,6 +649,8 @@ if __name__ == "__main__":
 
     # init (and write) the tokenizer
     enc = tiktoken.get_encoding("gpt2")
+    encode = lambda s: enc.encode(s, allowed_special={"<|endoftext|>"})
+    decode = lambda l: enc.decode(l)
     if master_process and args.write_tensors: # tokenizer is technically not tensors but ok
         write_tokenizer(enc, "gpt2_tokenizer.bin")
 
@@ -670,38 +676,49 @@ if __name__ == "__main__":
         model = torch.compile(model)
 
     # -------------------------------------------------------------------------
-    # Our own version of a simple DistributedDataLoader
 
     # load tokens
-    train_loader = DistributedDataLoader(args.input_bin, B, T, ddp_rank, ddp_world_size)
-    val_loader = None
-    if args.input_val_bin:
-        val_loader = DistributedDataLoader(args.input_val_bin, B, T, ddp_rank, ddp_world_size)
+    assert os.path.isfile(args.input_bin)
+    print0(f"loading cached tokens in {args.input_bin}")
+    with open(args.input_bin, "rb") as f:
+        tokens = np.frombuffer(f.read(), dtype=np.int32)
 
+    # np -> tensor, long, on device
+    tokens = torch.tensor(tokens)
+    tokens = tokens.to(torch.long)
+
+    # lightweight dataloader
+    def get_batch():
+        assert B*T+1 <= len(tokens), "not enough tokens"
+        i = 0
+        while True:
+            x = tokens[i:i+B*T].view(B, T)
+            y = tokens[i+1:i+B*T+1].view(B, T)
+            yield x, y
+            i += B*T
+            if i + B*T + 1 >= len(tokens):
+                i = 0
+    # fetch one batch of data, which we will overfit to
+    data_iter = iter(get_batch())
+    x, y = next(data_iter) # we'll overfit this batch below
+    x = x.to(device)
+    y = y.to(device)
     # -------------------------------------------------------------------------
     # PyTorch -> C bridge: save some weights and state for C to load later as reference
 
     # do one forward pass to generate ground truth for our C tests
     if master_process and args.write_tensors and (not args.inference_only):
-        x, y = train_loader.next_batch()
-        x, y = x.to(device), y.to(device)
         logits, loss = model(x, y)
         loss.backward()
         # save model params, in both float32 and bfloat16
         model_to_size = {"gpt2": "124M", "gpt2-medium": "355M", "gpt2-large": "774M", "gpt2-xl": "1558M"}
         model_to_size.update({f"d{d}": f"d{d}" for d in [12, 24, 36, 48]})
         model_size_str = model_to_size[args.model] # e.g. "124M", or "d12"
-        write_model(model, f"gpt2_{model_size_str}.bin", dtype="float32")
-        write_model(model, f"gpt2_{model_size_str}_bf16.bin", dtype="bfloat16")
+        write_model(model, f"checkpoints/gpt2_{model_size_str}.bin", dtype="float32")
+        write_model(model, f"checkpoints/gpt2_{model_size_str}_bf16.bin", dtype="bfloat16")
         # save x, y, logits, loss, and parameter gradients, for debugging C
         # always store these in fp32 to have an accurate reference (?)
-        write_state(model, x, y, logits, loss, f"gpt2_{model_size_str}_debug_state.bin")
-        # reset the train_loader for the optimization below
-        train_loader.reset()
-        # clear the grads here explicitly because otherwise we'd have a duplicate grad accumulation
-        # since in the training loop we do a backward() and then zero_grad() at the end of the loop
-        # this would cause an incorrect first training step
-        model.zero_grad()
+        write_state(model, x, y, logits, loss, f"checkpoints/gpt2_{model_size_str}_debug_state.bin")
 
     # -------------------------------------------------------------------------
     # main training loop
@@ -711,128 +728,25 @@ if __name__ == "__main__":
         model = DDP(model, device_ids=[ddp_local_rank])
     raw_model = model.module if ddp else model # always contains the "raw" unwrapped model
 
+    if ddp:
+        model = DDP(model, device_ids=[ddp_local_rank])
+    raw_model = model.module if ddp else model # always contains the "raw" unwrapped model
+
     # init the optimizer
-    optimizer = raw_model.configure_optimizers(weight_decay=args.weight_decay,
-                                               learning_rate=args.learning_rate, betas=(0.9, 0.95),
-                                               device_type=device, zero_stage=zero_stage)
-
-    # learning rate decay scheduler (cosine with warmup)
-    def get_lr(it):
-        min_lr = args.learning_rate * args.learning_rate_decay_frac
-        # 1) linear warmup for warmup_iters steps
-        if it < args.warmup_iters:
-            return args.learning_rate * (it+1) / args.warmup_iters
-        # 2) if it > lr_decay_iters, return min learning rate
-        if it > args.num_iterations:
-            return min_lr
-        # 3) in between, use cosine decay down to min learning rate
-        decay_ratio = (it - args.warmup_iters) / (args.num_iterations - args.warmup_iters)
-        assert 0 <= decay_ratio <= 1
-        coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio)) # coeff starts at 1 and goes to 0
-        return min_lr + coeff * (args.learning_rate - min_lr)
-
-    # create the logging directory if it does not exist
-    logfile = None
-    if args.output_dir:
-        os.makedirs(args.output_dir, exist_ok=True)
-        logfile = os.path.join(args.output_dir, "main.log")
-        # create the log file "main.log" inside it, and wipe it clean
-        with open(logfile, "w") as f:
-            pass
+    adam_use_fused = device == "cuda" # only works on CUDA (?)
+    optimizer = torch.optim.Adam(raw_model.parameters(), lr=1e-4, fused=adam_use_fused)
 
     if device == "cuda":
         torch.cuda.reset_peak_memory_stats()
     timings = []
-    norm = -1.0   # dummy value to print in inference-only mode
-    for step in range(args.num_iterations + 1):
+    for i in range(args.num_iterations):
         t0 = time.time()
-        last_step = (step == args.num_iterations)
-
-        # once in a while evaluate the validation dataset
-        if (args.val_loss_every > 0 \
-            and (step % args.val_loss_every == 0 or last_step)) \
-            and (val_loader is not None):
-            model.eval()
-            val_loader.reset()
-            with torch.no_grad():
-                val_loss = 0.0
-                for _ in range(args.val_max_steps):
-                    x, y = val_loader.next_batch()
-                    x, y = x.to(device), y.to(device)
-                    _, loss = model(x, y, return_logits=False)
-                    val_loss += loss.item()
-                val_loss /= args.val_max_steps
-            # log to console and to file
-            print0(f"val loss {val_loss}")
-            if master_process and logfile is not None:
-                with open(logfile, "a") as f:
-                    f.write("s:%d tel:%f\n" % (step, val_loss))
-
-        # once in a while perform model inference on the master process
-        if (args.sample_every > 0 \
-            and (step % args.sample_every == 0 or last_step)) \
-            and master_process:
-            model.eval()
-            # before we end, let's also do one round of inference
-            # we'll kick off the generation with "<|endoftext|>", which designates the start of a new sequence
-            start_ids = [enc.eot_token]
-            xg = (torch.tensor(start_ids, dtype=torch.long, device=device)[None, ...])
-            max_new_tokens = 32
-            temperature = 1.0
-            top_k = 40
-            yg = raw_model.generate(xg, max_new_tokens, temperature=temperature, top_k=top_k)
-            print0('---------------')
-            print0(enc.decode(yg[0].tolist()))
-            print0('---------------')
-
-        # bit confusing: we want to make sure to eval and sample on 0th iteration
-        # but also after the very last iteration. so we loop for step <= num_iterations
-        # instead of just < num_iterations (one extra due to <=), only to do
-        # the validation/sampling one last time, and then we break right here as we're done.
-        if last_step:
-            break
-
-        # --------------- TRAINING SECTION BEGIN -----------------
-        model.train()
-        # micro-batch loop where we do gradient accumulation to reach desired total batch size
-        lossf = 0.0 # for getting the mean loss (as simple float) over the accumulation steps
-        for micro_step in range(grad_accum_steps):
-            # fetch a batch
-            if not args.overfit_single_batch \
-                or (args.overfit_single_batch and step == 0 and micro_step == 0):
-                x, y = train_loader.next_batch()
-                x, y = x.to(device), y.to(device)
-            # forward pass
-            with ctx:
-                _, loss = model(x, y, return_logits=False)
-                # we have to scale the loss to account for gradient accumulation,
-                # because the gradients just add on each successive backward().
-                # addition of gradients corresponds to a SUM in the objective, but
-                # instead of a SUM we want MEAN, so we scale the loss here
-                loss = loss / grad_accum_steps
-                lossf += loss.detach() # keep track of the mean loss
-            # backward pass
-            if ddp:
-                # we want only the last micro-step to sync grads in a DDP model
-                # the official way to do this is with model.no_sync(), but that is a
-                # context manager that bloats the code, so we just toggle this variable
-                model.require_backward_grad_sync = (micro_step == grad_accum_steps - 1)
-            if not args.inference_only:
-                loss.backward()
-        if ddp:
-            dist.all_reduce(lossf, op=dist.ReduceOp.AVG)
-        lossf = lossf.item()
-        norm = torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
-        # determine and set the learning rate for this iteration
-        lr = get_lr(step)
-        for param_group in optimizer.param_groups:
-            param_group['lr'] = lr
-        # step the optimizer
-        optimizer.step()
-        optimizer.zero_grad(set_to_none=True)
-        # --------------- TRAINING SECTION END -------------------
-        # everything that follows now is just diagnostics, prints, logging, etc.
-
+        with ctx:
+            _, loss = model(x, y, return_logits=False)
+        if not args.inference_only:
+            optimizer.zero_grad(set_to_none=True)
+            loss.backward()
+            optimizer.step()
         # wait on the CPU for all device work to end so we get accurate per-iteration timings below
         if device == "mps":
             torch.mps.synchronize()
@@ -841,21 +755,34 @@ if __name__ == "__main__":
         # time and print
         t1 = time.time()
         # the 0th iteration is often an outlier (much slower) => skip logging it
-        tokens_per_second = grad_accum_steps * ddp_world_size * B * T / (t1-t0)
-        print0(f"step {step+1:4d}/{args.num_iterations} | train loss {lossf:.6f} | norm {norm:.4f} | lr {lr:.2e} | ({(t1-t0)*1000:.2f} ms | {tokens_per_second:.0f} tok/s)")
-        # log to logile
-        if master_process and logfile is not None:
-            with open(logfile, "a") as f:
-                f.write("s:%d trl:%f\n" % (step, lossf))
-
-        # keep track of smooth timings, last 20 iterations
-        if step > 0 and step > args.num_iterations - 20:
+        tokens_per_second = ddp_world_size * B * T / (t1-t0)
+        print0(f"iteration {i+1}, loss: {loss.item():.4f}, time: {(t1-t0)*1000:.3f}ms, tok/s: {tokens_per_second:.2f}")
+        if i > 0 and i > args.num_iterations - 20:
             timings.append(t1-t0)
 
     # print the average of the last 20 timings, to get something smooth-ish
     timings = timings[-20:]
     print0(f"final {len(timings)} iters avg: {np.mean(timings)*1000:.3f}ms")
     print0(f"peak memory consumption: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB")
+
+    # -------------------------------------------------------------------------
+    # STAGE 3: Few steps of inference
+    if master_process:
+
+        # before we end, let's also do one round of inference
+        # we'll kick off the generation with "<|endoftext|>", which designates the start of a new sequence
+        start = "<|endoftext|>"
+        start_ids = encode(start)
+        x = (torch.tensor(start_ids, dtype=torch.long, device=device)[None, ...])
+
+        # run generation for 16 time steps (tokens)
+        max_new_tokens = 16
+        temperature = 1.0
+        top_k = 40
+        raw_model.eval()
+        y = raw_model.generate(x, max_new_tokens, temperature=temperature, top_k=top_k)
+        print0(decode(y[0].tolist()))
+        print0('---------------')
 
     # -------------------------------------------------------------------------
     # clean up nice
